@@ -1,0 +1,772 @@
+This article describes the Python threading synchronization mechanisms in details. We are going to study the following types: Lock, RLock, Semaphore, Condition, Event and Queue. Also, we are going to look at the Python internals behind those mechanisms.
+
+The source code of the programs below can be found at github.com/laurentluce/python-tutorials under threads/.
+
+First, let's look at a simple program using the threading module with no synchronization.
+
+<h2>Threading</h2>
+
+We want to write a program fetching the content of some URLs and writing it to a file. We could do it serially with no threads but to speed things up, we are going to create 2 threads processing half of the URLs each.
+
+Note: The best way here would be to use a queue with the URLs to fetch but this example is more suitable to begin our tutorial.
+
+The class FetchUrls is thread based and it takes a list of URLs to fetch and a file object to write the content to.
+
+[code lang="python"]
+class FetchUrls(threading.Thread):
+  """
+  Thread checking URLs.
+  """
+
+  def __init__(self, urls, output):
+    """
+    Constructor.
+
+    @param urls list of urls to check
+    @param output file to write urls output
+    """
+    threading.Thread.__init__(self)
+    self.urls = urls
+    self.output = output
+  
+  def run(self):
+    """
+    Thread run method. Check URLs one by one.
+    """
+    while self.urls:
+      url = self.urls.pop()
+      req = urllib2.Request(url)
+      try:
+        d = urllib2.urlopen(req)
+      except urllib2.URLError, e:
+        print 'URL %s failed: %s' % (url, e.reason)
+      self.output.write(d.read())
+      print 'write done by %s' % self.name
+      print 'URL %s fetched by %s' % (url, self.name)
+[/code]
+
+The main function starts the 2 threads and then wait for them to finish.
+
+[code lang="python"]
+def main():
+  # list 1 of urls to fetch
+  urls1 = ['http://www.google.com', 'http://www.facebook.com']
+  # list 2 of urls to fetch
+  urls2 = ['http://www.yahoo.com', 'http://www.youtube.com']
+  f = open('output.txt', 'w+')
+  t1 = FetchUrls(urls1, f)
+  t2 = FetchUrls(urls2, f)
+  t1.start()
+  t2.start()
+  t1.join()
+  t2.join()
+  f.close()
+
+if __name__ == '__main__':
+  main()
+[/code]
+
+The issue is that both threads are going to write to the file at the same time, resulting in a big mess. We need to find a way to only have 1 thread writing to the file at a given time. To do that, one way is to use synchronization mechanisms like locks.
+
+<h2>Lock</h2>
+
+Locks have 2 states: locked and unlocked. 2 methods are used to manipulate them: acquire() and release(). Those are the rules:
+
+<ul>
+<li>if the state is unlocked: a call to acquire() changes the state to locked.</li>
+<li>if the state is locked: a call to acquire() blocks until another thread calls release().</li>
+<li>if the state is unlocked: a call to release() raises a RuntimeError exception.</li>
+<li>if the state is locked: a call to release() changes the state to unlocked().</li>
+</ul> 
+
+To solve our issue of 2 threads writing to the same file at the same time, we pass a lock to the FetchUrls constructor and we use it to protect the file write operation. I am just going to highlight the modifications relevant to locks. The source code can be found in threads/lock.py.
+
+[code lang="python"]
+class FetchUrls(threading.Thread):
+  ...
+
+  def __init__(self, urls, output, lock):
+    ...
+    self.lock = lock
+  
+  def run(self):
+    ...
+    while self.urls:
+      ...
+      self.lock.acquire()
+      print 'lock acquired by %s' % self.name
+      self.output.write(d.read())
+      print 'write done by %s' % self.name
+      print 'lock released by %s' % self.name
+      self.lock.release()
+      ...
+
+def main():
+  ...
+  lock = threading.Lock()
+  ...
+  t1 = FetchUrls(urls1, f, lock)
+  t2 = FetchUrls(urls2, f, lock)
+  ...
+[/code]
+
+<img src="/images/blog/threads/lock.png">
+
+Let's look at the program output when we run it:
+
+[code lang="bash"]
+$ python locks.py
+lock acquired by Thread-2
+write done by Thread-2
+lock released by Thread-2
+URL http://www.youtube.com fetched by Thread-2
+lock acquired by Thread-1
+write done by Thread-1
+lock released by Thread-1
+URL http://www.facebook.com fetched by Thread-1
+lock acquired by Thread-2
+write done by Thread-2
+lock released by Thread-2
+URL http://www.yahoo.com fetched by Thread-2
+lock acquired by Thread-1
+write done by Thread-1
+lock released by Thread-1
+URL http://www.google.com fetched by Thread-1
+[/code]
+
+The write operation is now protected by a lock and we don't have 2 threads writing to the file at the same time.
+
+Let's take a look at the Python internals. I am using Python 2.6.6 on Linux.
+
+The method Lock() of the threading module is equal to thread.allocate_lock. You can see the code in Lib/threading.py.
+
+[code lang="python"]
+Lock = _allocate_lock
+_allocate_lock = thread.allocate_lock
+[/code]
+
+The C implementation can be found in Python/thread_pthread.h. We assume that our system supports POSIX semaphores. sem_init() initializes the semaphore at the address pointed by lock. The initial value of the semaphore is 1 which means unlocked. The semaphore is shared between the threads of the process.
+
+[code lang="c"]
+PyThread_type_lock
+PyThread_allocate_lock(void)
+{
+    ...
+    lock = (sem_t *)malloc(sizeof(sem_t));
+
+    if (lock) {
+        status = sem_init(lock,0,1);
+        CHECK_STATUS("sem_init");
+        ....
+    }
+    ...
+}
+[/code]
+
+When the acquire() method is called, the following C code is executed. waitflag is equal to 1 by default which means the call blocks until the lock is unlocked. sem_wait() decrements the semaphore's value or blocks until the value is greater than 0 e.g. unlocked by another thread.
+
+[code lang="c"]
+int
+PyThread_acquire_lock(PyThread_type_lock lock, int waitflag)
+{
+    ...
+    do {
+        if (waitflag)
+            status = fix_status(sem_wait(thelock));
+        else
+            status = fix_status(sem_trywait(thelock));
+    } while (status == EINTR); /* Retry if interrupted by a signal */
+    ....
+}
+[/code]
+
+When the release() method is called, the following C code is executed. sem_post() increments the semaphore's value e.g. unlocks the semaphore.
+[code lang="c"]
+void
+PyThread_release_lock(PyThread_type_lock lock)
+{
+    ...
+    status = sem_post(thelock);
+    ...
+}
+[/code]
+
+<h2>RLock</h2>
+
+RLock is a reentrant lock. acquire() can be called multiple times by the same thread without blocking. Keep in mind that release() needs to be called the same number of times to unlock the resource.
+
+Using Lock, the second call to acquire() by the same thread will block:
+[code lang="python"]
+lock = threading.Lock()
+lock.acquire()
+lock.acquire()
+[/code]
+
+If you use RLock, the second call to acquire() won't block.
+[code lang="python"]
+rlock = threading.RLock()
+rlock.acquire()
+rlock.acquire()
+[/code]
+
+RLock also uses thread.allocate_lock() but it keeps track of the owner thread to support the reentrant feature. Following is the RLock acquire() method implementation. If the thread calling acquire() is the owner of the resource then the counter is incremented by one. If not, it tries to acquire it. First time it acquires the lock, the owner is saved and the counter is initialized to 1.
+
+[code lang="python"]
+def acquire(self, blocking=1):
+    me = _get_ident()
+    if self.__owner == me:
+        self.__count = self.__count + 1
+        ...
+        return 1
+    rc = self.__block.acquire(blocking)
+    if rc:
+        self.__owner = me
+        self.__count = 1
+        ...
+    ...
+    return rc
+[/code]
+
+Let's look at the RLock release() method. First is a check to make sure the thread calling the method is the owner of the lock. The counter is decremented and if it is equal to 0 then the resource is unlocked and available for grab by another thread. 
+
+[code lang="python"]
+def release(self):
+    if self.__owner != _get_ident():
+        raise RuntimeError("cannot release un-acquired lock")
+    self.__count = count = self.__count - 1
+    if not count:
+        self.__owner = None
+        self.__block.release()
+        ...
+    ...
+[/code]
+
+<h2>Condition</h2>
+
+This is a synchronization mechanism where a thread waits for a specific condition and another thread signals that this condition has happened.
+
+A good way to illustrate this mechanism is by looking at a producer/consumer example. The producer appends random integers to a list at random time and the consumer retrieves those integers from the list. The source code can be found in threads/condition.py.
+
+Let's look at the producer class. The producer acquires the lock, appends an integer, notifies the consumer thread that there is something to retrieve and release the lock. It does that forever with a random pause in between each append operation.
+
+[code lang="python"]
+class Producer(threading.Thread):
+  """
+  Produces random integers to a list
+  """
+
+  def __init__(self, integers, condition):
+    """
+    Constructor.
+
+    @param integers list of integers
+    @param condition condition synchronization object
+    """
+    threading.Thread.__init__(self)
+    self.integers = integers
+    self.condition = condition
+  
+  def run(self):
+    """
+    Thread run method. Append random integers to the integers list at random time.
+    """
+    while True:
+      integer = random.randint(0, 256)
+      self.condition.acquire()
+      print 'condition acquired by %s' % self.name
+      self.integers.append(integer) 
+      print '%d appended to list by %s' % (integer, self.name)
+      print 'condition notified by %s' % self.name
+      self.condition.notify()
+      print 'condition released by %s' % self.name
+      self.condition.release()
+      time.sleep(1)
+[/code]
+
+Next is the consumer class. It acquires the lock, checks if there is an integer in the list, if there is nothing, it waits to be notified by the producer. Once the element is retrieved from the list, it releases the lock.
+
+Note that a call to wait() releases the lock so the producer can acquire the resource and do its work.
+
+[code lang="python"]
+class Consumer(threading.Thread):
+  """
+  Consumes random integers from a list
+  """
+
+  def __init__(self, integers, condition):
+    """
+    Constructor.
+
+    @param integers list of integers
+    @param condition condition synchronization object
+    """
+    threading.Thread.__init__(self)
+    self.integers = integers
+    self.condition = condition
+  
+  def run(self):
+    """
+    Thread run method. Consumes integers from list
+    """
+    while True:
+      self.condition.acquire()
+      print 'condition acquired by %s' % self.name
+      while True:
+        if self.integers:
+          integer = self.integers.pop()
+          print '%d popped from list by %s' % (integer, self.name)
+          break
+        print 'condition wait by %s' % self.name
+        self.condition.wait()
+      print 'condition released by %s' % self.name
+      self.condition.release()
+[/code]
+
+<img src="/images/blog/threads/condition.png">
+
+We need to write our main creating 2 threads and starting them:
+
+[code lang="python"]
+def main():
+  integers = []
+  condition = threading.Condition()
+  t1 = Producer(integers, condition)
+  t2 = Consumer(integers, condition)
+  t1.start()
+  t2.start()
+  t1.join()
+  t2.join()
+
+if __name__ == '__main__':
+  main()
+[/code]
+
+The output of this program looks like this:
+
+[code lang="bash"]
+$ python condition.py
+condition acquired by Thread-1
+159 appended to list by Thread-1
+condition notified by Thread-1
+condition released by Thread-1
+condition acquired by Thread-2
+159 popped from list by Thread-2
+condition released by Thread-2
+condition acquired by Thread-2
+condition wait by Thread-2
+condition acquired by Thread-1
+116 appended to list by Thread-1
+condition notified by Thread-1
+condition released by Thread-1
+116 popped from list by Thread-2
+condition released by Thread-2
+condition acquired by Thread-2
+condition wait by Thread-2
+[/code]
+
+Thread-1 appends 159 to the list then notifies the consumer and releases the lock. Thread-2 acquires the lock, retrieves 159 and releases the lock. The producer is still waiting at that time because of the time.sleep(1) so the consumer acquires the lock again then waits to get notified by the producer. When wait() is called, it unlocks the resource so the producer can acquire it and append a new integer to the list before notifying the consumer.
+
+Let's look at the Python internals for this condition synchronization mechanism. The condition's constructor creates a RLock object if no existing lock is passed to the constructor. This lock will be used when acquire() and release() are called.
+
+[code lang="python"]
+class _Condition(_Verbose):
+
+    def __init__(self, lock=None, verbose=None):
+        _Verbose.__init__(self, verbose)
+        if lock is None:
+            lock = RLock()
+        self.__lock = lock
+[/code]
+
+Next is the wait() method. We assume that we are calling wait() with no timeout value to simplify the explanation of the wait() method's code. A new lock named waiter is created and the state is set to locked. The waiter lock is used for communication between the threads so the producer can notify the consumer by releasing this waiter lock. The lock object is added to the waiters list and the method is blocking at waiter.acquire(). Note that the condition lock state is saved at the beginning and restored when wait() returns. 
+
+[code lang="python"]
+def wait(self, timeout=None):
+    ...
+    waiter = _allocate_lock()
+    waiter.acquire()
+    self.__waiters.append(waiter)
+    saved_state = self._release_save()
+    try:    # restore state no matter what (e.g., KeyboardInterrupt)
+        if timeout is None:
+            waiter.acquire()
+            ...
+        ...
+    finally:
+        self._acquire_restore(saved_state)
+[/code]
+
+The notify() method is used to release the waiter lock. The producer calls notify() to notify the consumer blocked on wait().
+
+[code lang="python"]
+def notify(self, n=1):
+    ...
+    __waiters = self.__waiters
+    waiters = __waiters[:n]
+    ...
+    for waiter in waiters:
+        waiter.release()
+        try:
+            __waiters.remove(waiter)
+        except ValueError:
+            pass
+[/code]
+
+<h2>Semaphore</h2>
+
+A semaphore is based on an internal counter which is decremented each time acquire() is called and incremented each time release() is called. If the counter is equal to 0 then acquire() blocks. It is the Python implementation of the Dijkstra semaphore concept: P() and V(). Using a semaphore makes sense when you want to control access to a resource with limited capacity like a server.
+
+Here is a simple example:
+
+[code lang="python"]
+semaphore = threading.Semaphore()
+semaphore.acquire()
+# work on a shared resource
+...
+semaphore.release()
+[/code]
+
+Let's look at the Python internals. The constructor takes a value which is the counter initial value. This value defaults to 1. A condition instance is created with a lock to protect the counter and to notify the other thread when the semaphore is released.
+
+[code lang="python"]
+class _Semaphore(_Verbose):
+    ...    
+    def __init__(self, value=1, verbose=None):
+        _Verbose.__init__(self, verbose)
+        self.__cond = Condition(Lock())
+        self.__value = value
+        ...
+[/code]
+
+Next is the acquire() method. If the semaphore's counter is equal to 0, it blocks on the condition's wait() method until it gets notified by a different thread. If the semaphore's counter is greater than 0, it decrements the value.
+
+[code lang="python"]
+def acquire(self, blocking=1):
+    rc = False
+    self.__cond.acquire()
+    while self.__value == 0:
+        ...
+        self.__cond.wait()
+    else:
+        self.__value = self.__value - 1
+        rc = True
+    self.__cond.release()
+    return rc
+[/code]
+
+The semaphore's release() method increments the counter and then notifies the other thread.
+
+[code lang="python"]
+def release(self):
+    self.__cond.acquire()
+    self.__value = self.__value + 1
+    self.__cond.notify()
+    self.__cond.release()
+[/code]
+
+Note that there is also a bounded semaphore you can use to make sure you never call release() too many times. Here is the Python internal code use for it:
+
+[code lang="python"]
+class _BoundedSemaphore(_Semaphore):
+    """Semaphore that checks that # releases is <= # acquires"""
+    def __init__(self, value=1, verbose=None):
+        _Semaphore.__init__(self, value, verbose)
+        self._initial_value = value
+
+    def release(self):
+        if self._Semaphore__value >= self._initial_value:
+            raise ValueError, "Semaphore released too many times"
+        return _Semaphore.release(self)
+[/code]
+
+<h2>Event</h2>
+
+This is a simple mechanism. A thread signals an event and the other thread(s) wait for it.
+
+Let's go back to our producer and consumer example and convert it to use an event instead of a condition. The source code can be found in threads/event.py.
+
+First the producer class. We pass an Event instance to the constructor instead of a Condition instance. Each time an integer is added to the list, the event is set then cleared right away to notify the consumer. The event instance is cleared by default.
+
+[code lang="python"]
+class Producer(threading.Thread):
+  """
+  Produces random integers to a list
+  """
+
+  def __init__(self, integers, event):
+    """
+    Constructor.
+
+    @param integers list of integers
+    @param event event synchronization object
+    """
+    threading.Thread.__init__(self)
+    self.integers = integers
+    self.event = event
+  
+  def run(self):
+    """
+    Thread run method. Append random integers to the integers list at random time.
+    """
+    while True:
+      integer = random.randint(0, 256)
+      self.integers.append(integer) 
+      print '%d appended to list by %s' % (integer, self.name)
+      print 'event set by %s' % self.name
+      self.event.set()
+      print 'event cleared by %s' % self.name
+      self.event.clear()
+      time.sleep(1)
+[/code]
+
+Next is the consumer class. We also pass an Event instance to the constructor. The consumer instance is blocking on wait() until the event is set indicating that there is an integer to consume.
+
+[code lang="python"]
+class Consumer(threading.Thread):
+  """
+  Consumes random integers from a list
+  """
+
+  def __init__(self, integers, event):
+    """
+    Constructor.
+
+    @param integers list of integers
+    @param event event synchronization object
+    """
+    threading.Thread.__init__(self)
+    self.integers = integers
+    self.event = event
+  
+  def run(self):
+    """
+    Thread run method. Consumes integers from list
+    """
+    while True:
+      self.event.wait()
+      integer = self.integers.pop()
+      print '%d popped from list by %s' % (integer, self.name)
+[/code]
+
+<img src="/images/blog/threads/event.png">
+
+This is the output when we run the program. Thread-1 appends 124 to the list and then set the event to notify the consumer. The consumer's call to wait() stops blocking and the integer is retrieved from the list.
+
+[code lang="bash"]
+$ python event.py 
+124 appended to list by Thread-1
+event set by Thread-1
+event cleared by Thread-1
+124 popped from list by Thread-2
+223 appended to list by Thread-1
+event set by Thread-1
+event cleared by Thread-1
+223 popped from list by Thread-2
+[/code]
+
+Let's look at the Python internals. First is the Event constructor. A condition instance is created with a lock to protect the event flag value and to notify the other thread when the event has been set.
+
+[code lang="python"]
+class _Event(_Verbose):
+    def __init__(self, verbose=None):
+        _Verbose.__init__(self, verbose)
+        self.__cond = Condition(Lock())
+        self.__flag = False
+[/code]
+
+Following is the set() method. It sets the flag to True and notifies the other threads. The condition object is used to protect the critical part when the flag's value is changed.
+
+[code lang="python"]
+def set(self):
+    self.__cond.acquire()
+    try:
+        self.__flag = True
+        self.__cond.notify_all()
+    finally:
+        self.__cond.release()
+[/code]
+
+Its opposite is the clear() method setting the flag to False.
+
+[code lang="python"]
+def clear(self):
+    self.__cond.acquire()
+    try:
+        self.__flag = False
+    finally:
+        self.__cond.release()
+[/code]
+
+The wait() method blocks until the set method is called. The wait() method does nothing if the flag is set.
+
+[code lang="python"]
+def wait(self, timeout=None):
+    self.__cond.acquire()
+    try:
+        if not self.__flag:
+            self.__cond.wait(timeout)
+    finally:
+        self.__cond.release()
+[/code]
+
+<h2>Queue</h2>
+
+Queues are a great mechanism when we need to exchange information between threads as it takes care of locking for us.
+
+We are interested in the following 4 Queue methods:
+
+<ul>
+<li><b>put:</b> Put an item to the queue.</li>
+<li><b>get:</b> Remove and return an item from the queue.</li>
+<li><b>task_done:</b> Needs to be called each time an item has been processed.</li>
+<li><b>join:</b> Blocks until all items have been processed.</li>
+</ul>
+
+Let's convert our producer/consumer program to use a queue. The source code can be found in threads/queue.py.
+
+First the producer class. We don't need to pass the integers list because we are using the queue to store the integers generated. The thread generates and puts the integers in the queue in a forever loop.
+
+[code lang="python"]
+class Producer(threading.Thread):
+  """
+  Produces random integers to a list
+  """
+
+  def __init__(self, queue):
+    """
+    Constructor.
+
+    @param integers list of integers
+    @param queue queue synchronization object
+    """
+    threading.Thread.__init__(self)
+    self.queue = queue
+  
+  def run(self):
+    """
+    Thread run method. Append random integers to the integers list at random time.
+    """
+    while True:
+      integer = random.randint(0, 256)
+      self.queue.put(integer) 
+      print '%d put to queue by %s' % (integer, self.name)
+      time.sleep(1)
+[/code]
+
+Next is our consumer class. The thread gets the integer from the queue and indicates that it is done working on it using task_done().
+
+[code lang="python"]
+class Consumer(threading.Thread):
+  """
+  Consumes random integers from a list
+  """
+
+  def __init__(self, queue):
+    """
+    Constructor.
+
+    @param integers list of integers
+    @param queue queue synchronization object
+    """
+    threading.Thread.__init__(self)
+    self.queue = queue
+  
+  def run(self):
+    """
+    Thread run method. Consumes integers from list
+    """
+    while True:
+      integer = self.queue.get()
+      print '%d popped from list by %s' % (integer, self.name)
+      self.queue.task_done()
+[/code]
+
+Here is the output of the program.
+
+[code lang="bash"]
+$ python queue.py 
+61 put to queue by Thread-1
+61 popped from list by Thread-2
+6 put to queue by Thread-1
+6 popped from list by Thread-2
+[/code]
+
+The Queue module takes care of locking for us which is a great advantage. It is interesting to look at the Python internals to understand how the locking mechanism works underneath.
+
+The Queue constructor creates a lock to protect the queue when an element is added or removed. Some conditions objects are created to notify events like the queue is not empty (get() call stops blocking), queue is not full (put() call stops blocking) and all items have been processed (join() call stops blocking).
+
+[code lang="python"]
+class Queue:
+    def __init__(self, maxsize=0):
+        ...
+        self.mutex = threading.Lock()
+        self.not_empty = threading.Condition(self.mutex)
+        self.not_full = threading.Condition(self.mutex)
+        self.all_tasks_done = threading.Condition(self.mutex)
+        self.unfinished_tasks = 0
+[/code]
+
+The put() method adds an item or waits if the queue is full. It notifies the threads blocked on get() that the queue is not empty. See above for an explanation on the Condition object for more details.
+
+[code lang="python"]
+def put(self, item, block=True, timeout=None):
+    ...
+    self.not_full.acquire()
+    try:
+        if self.maxsize > 0:
+            ...
+            elif timeout is None:
+                while self._qsize() == self.maxsize:
+                    self.not_full.wait()
+        self._put(item)
+        self.unfinished_tasks += 1
+        self.not_empty.notify()
+    finally:
+        self.not_full.release()
+[/code]
+
+The get() method removes an element from the queue or waits if the queue is empty. It notifies the threads blocked on put() that the queue is not full.
+
+[code lang="python"]
+def get(self, block=True, timeout=None):
+    ...
+    self.not_empty.acquire()
+    try:
+        ...
+        elif timeout is None:
+            while not self._qsize():
+                self.not_empty.wait()
+        item = self._get()
+        self.not_full.notify()
+        return item
+    finally:
+        self.not_empty.release()
+[/code]
+
+When the method task_done() is called, the number of unfinished tasks is decremented. If the counter is equal to 0 then the threads waiting on the queue join() method continue their execution.
+
+[code lang="python"]
+def task_done(self):
+    self.all_tasks_done.acquire()
+    try:
+        unfinished = self.unfinished_tasks - 1
+        if unfinished <= 0:
+            if unfinished < 0:
+                raise ValueError('task_done() called too many times')
+            self.all_tasks_done.notify_all()
+        self.unfinished_tasks = unfinished
+    finally:
+        self.all_tasks_done.release()
+
+def join(self):
+    self.all_tasks_done.acquire()
+    try:
+        while self.unfinished_tasks:
+            self.all_tasks_done.wait()
+    finally:
+        self.all_tasks_done.release()
+[/code]
+
+<img src="/images/blog/threads/queue.png">
+
+That's it for now. I hope you enjoyed this article. Please write a comment if you have any feedback.
