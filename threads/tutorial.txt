@@ -191,6 +191,23 @@ PyThread_release_lock(PyThread_type_lock lock)
 }
 [/code]
 
+You can also use the "with" statement. The Lock object can be used as a context manager. The advantage of using "with" is that the acquire() method will be called when the "with" block is entered and release() will be called when the block is exited. Let's rewrite the class FetchUrls using the "with" statement.
+
+[code lang="python"]
+class FetchUrls(threading.Thread):
+  ...
+  def run(self):
+    ...
+    while self.urls:
+      ...
+      with self.lock:
+        print 'lock acquired by %s' % self.name
+        self.output.write(d.read())
+        print 'write done by %s' % self.name
+        print 'lock released by %s' % self.name
+      ...
+[/code]
+
 <h2>RLock</h2>
 
 RLock is a reentrant lock. acquire() can be called multiple times by the same thread without blocking. Keep in mind that release() needs to be called the same number of times to unlock the resource.
@@ -412,6 +429,39 @@ def notify(self, n=1):
             pass
 [/code]
 
+You can also use the "with" statement with the Condition object so acquire() and release() are called for us. Let's rewrite the producer class and the consumer class using "with".
+
+[code lang="python"]
+class Producer(threading.Thread):
+  ...
+  def run(self):
+    while True:
+      integer = random.randint(0, 256)
+      with self.condition:
+        print 'condition acquired by %s' % self.name
+        self.integers.append(integer) 
+        print '%d appended to list by %s' % (integer, self.name)
+        print 'condition notified by %s' % self.name
+        self.condition.notify()
+        print 'condition released by %s' % self.name
+      time.sleep(1)
+
+class Consumer(threading.Thread):
+  ... 
+  def run(self):
+    while True:
+      with self.condition:
+        print 'condition acquired by %s' % self.name
+        while True:
+          if self.integers:
+            integer = self.integers.pop()
+            print '%d popped from list by %s' % (integer, self.name)
+            break
+          print 'condition wait by %s' % self.name
+          self.condition.wait()
+        print 'condition released by %s' % self.name
+[/code]
+
 <h2>Semaphore</h2>
 
 A semaphore is based on an internal counter which is decremented each time acquire() is called and incremented each time release() is called. If the counter is equal to 0 then acquire() blocks. It is the Python implementation of the Dijkstra semaphore concept: P() and V(). Using a semaphore makes sense when you want to control access to a resource with limited capacity like a server.
@@ -477,6 +527,15 @@ class _BoundedSemaphore(_Semaphore):
         if self._Semaphore__value >= self._initial_value:
             raise ValueError, "Semaphore released too many times"
         return _Semaphore.release(self)
+[/code]
+
+You can also use the "with" statement with the Semaphore object so acquire() and release() are called for us.
+
+[code lang="python"]
+semaphore = threading.Semaphore()
+with semaphore:
+  # work on a shared resource
+  ...
 [/code]
 
 <h2>Event</h2>
