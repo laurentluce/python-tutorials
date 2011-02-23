@@ -544,7 +544,7 @@ This is a simple mechanism. A thread signals an event and the other thread(s) wa
 
 Let's go back to our producer and consumer example and convert it to use an event instead of a condition. The source code can be found in threads/event.py.
 
-First the producer class. We pass an Event instance to the constructor instead of a Condition instance. Each time an integer is added to the list, the event is set then cleared right away to notify the consumer. The event instance is cleared by default.
+First the producer class. We pass an Event instance to the constructor instead of a Condition instance. Once the integers are added to the list, the event is set then cleared right away to notify the consumer. The event instance is cleared by default.
 
 [code lang="python"]
 class Producer(threading.Thread):
@@ -573,8 +573,8 @@ class Producer(threading.Thread):
       print '%d appended to list by %s' % (integer, self.name)
       print 'event set by %s' % self.name
       self.event.set()
-      print 'event cleared by %s' % self.name
       self.event.clear()
+      print 'event cleared by %s' % self.name
       time.sleep(1)
 [/code]
 
@@ -603,8 +603,12 @@ class Consumer(threading.Thread):
     """
     while True:
       self.event.wait()
-      integer = self.integers.pop()
-      print '%d popped from list by %s' % (integer, self.name)
+      try:
+        integer = self.integers.pop()
+        print '%d popped from list by %s' % (integer, self.name)
+      except IndexError:
+        # catch pop on empty list
+        time.sleep(1)
 [/code]
 
 <img src="/images/blog/threads/event.png">

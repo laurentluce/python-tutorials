@@ -31,7 +31,6 @@ class Producer(threading.Thread):
       self.event.set()
       print 'event cleared by %s' % self.name
       self.event.clear()
-      time.sleep(1)
 
 class Consumer(threading.Thread):
   """
